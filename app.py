@@ -1,111 +1,97 @@
 #!/usr/bin/env python3
 """
-Flask YouTube downloader — v4.2  (2025-08-03)
-─────────────────────────────────────────────
-* Exactly **one** active download per IP (FIFO).
-* **100** concurrent downloads server-wide.
-* Unlimited global queue depth.
-* Per-IP sliding-window limiter: ≤ 6 URLs / min.
-* 24-hour finished-video cache prevents duplicate spam.
+Flask YouTube downloader — v4.3  (2025-08-03)
+
+* One active download per IP (FIFO)
+* 100 concurrent downloads server-wide
+* 6 URLs / minute sliding-window IP limiter
+* 24-hour finished cache prevents duplicate spam
+* Optional “audio only” mode (m4a)
+* Files are removed immediately after they finish streaming
 """
 
 from __future__ import annotations
-
 import os, re, unicodedata, uuid, shutil, time, threading, concurrent.futures
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
-from yt_dlp import YoutubeDL, utils as ytdl_utils, DownloadError   # add DownloadError
+from flask import (
+    Flask, render_template, request, jsonify, Response,
+    send_file, stream_with_context,
+)
+from yt_dlp import YoutubeDL, utils as ytdl_utils, DownloadError
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# ───────── configurable limits ──────────────────────────────────
-BASE_DIR                  = os.path.dirname(__file__)
-
-# ─── persistent download directory detection ───────────────────────────
-from pathlib import Path
+# ───────────────────────────────────────────────────────────────
+# configurable paths & limits
+# ───────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent
 
 def _detect_dl_dir() -> Path:
-    """Return a persistent directory for video files.
-
-    Priority:
-      1. Explicit DL_DIR env var (always wins)
-      2. Railway-attached volume mount path
-      3. Hard-coded /data fallback when running on Railway
-      4. Local dev: <project>/downloads
-    """
-    # 1. Let the operator override everything
     if os.getenv("DL_DIR"):
         return Path(os.getenv("DL_DIR"))
-
-    # 2. Auto-detect Railway volume mount (if you added one)
     if os.getenv("RAILWAY_VOLUME_MOUNT_PATH"):
         return Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH"))
-
-    # 3. Any other Railway container (no volume attached yet)
     if os.getenv("RAILWAY_PROJECT_ID"):
-        return Path("/data")           # matches Railway’s default UI suggestion
-
-    # 4. Fall back to a local folder next to the code
+        return Path("/data")
     return BASE_DIR / "downloads"
 
-DL_DIR = _detect_dl_dir()
-DL_DIR.mkdir(parents=True, exist_ok=True)
+DL_DIR                      = _detect_dl_dir(); DL_DIR.mkdir(parents=True, exist_ok=True)
+MAX_ACTIVE_PER_IP           = 1
+MAX_DOWNLOADS_GLOBAL        = 100
+MAX_REQUESTS_PER_IP_MIN     = 6
+MAX_URLS_PER_REQUEST        = 20
+MAX_QUEUE_PER_IP            = 50
+REQUEST_WINDOW              = timedelta(minutes=1)
+JOB_TTL                     = timedelta(hours=24)
+COMPLETED_CACHE_TTL         = timedelta(hours=24)
+TRUST_PROXY                 = [p.strip() for p in os.getenv("TRUST_PROXY", "").split(",") if p.strip()]
 
-MAX_ACTIVE_PER_IP         = 1      # sequential per IP
-MAX_DOWNLOADS_GLOBAL      = 100    # concurrent workers
-MAX_REQUESTS_PER_IP_MIN   = 6      # sliding-window URLs / minute
-MAX_URLS_PER_REQUEST      = 20
-MAX_QUEUE_PER_IP          = 50
-REQUEST_WINDOW            = timedelta(minutes=1)
-JOB_TTL                   = timedelta(hours=24)
-COMPLETED_CACHE_TTL       = timedelta(hours=24)   # block duplicate IDs this long
-
-TRUST_PROXY = [p.strip() for p in os.getenv("TRUST_PROXY", "").split(",") if p.strip()]
-
-# ───────── globals ──────────────────────────────────────────────
-app = Flask(__name__)
-
-jobs: dict[str, dict]                               = {}            # job_id → data
-url_map: dict[str, str | None]                      = {}            # video_id → job_id / "cached"
-completed_cache: dict[str, datetime]                = {}            # video_id → finished_ts
-ip_queues: defaultdict[str, deque[str]]             = defaultdict(deque)
-ip_active: dict[str, str]                           = {}            # ip → job_id
-ip_recent: defaultdict[str, deque[datetime]]        = defaultdict(deque)
-active_dl_set: set[str]                             = set()
+# ───────────────────────────────────────────────────────────────
+# globals
+# ───────────────────────────────────────────────────────────────
+app         = Flask(__name__)
+jobs        : dict[str, dict]        = {}            # job_id -> job data
+url_map     : dict[str, str|None]    = {}            # <vid>|a/v -> job_id / "cached"
+completed_cache: dict[str, datetime] = {}            # same key -> ts
+ip_queues   : defaultdict[str, deque[str]] = defaultdict(deque)
+ip_active   : dict[str, str]         = {}            # ip -> job_id
+ip_recent   : defaultdict[str, deque[datetime]] = defaultdict(deque)
+active_dl_set: set[str]              = set()
 
 LOCK = threading.Lock()
 EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=MAX_DOWNLOADS_GLOBAL)
 
-# ───────── helpers ──────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
+# helpers
+# ───────────────────────────────────────────────────────────────
+YOUTUBE_RE = re.compile(
+    r"^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)([\w-]{11})(?:[&#?].*)?$",
+    re.IGNORECASE,
+)
+
 def ffmpeg_ok() -> bool:
     return shutil.which("ffmpeg") is not None
 
-def clean_filename(title: str, vid: str, max_len: int = 80) -> str:
+def clean_filename(title: str, vid: str, ext: str, max_len: int = 80) -> str:
     s = unicodedata.normalize("NFC", title)
     s = re.sub(r'[\\/*?:"<>|]', "", s).strip() or vid
-    return f"{s[:max_len].rstrip() or vid}.mp4"
+    base = s[:max_len].rstrip() or vid
+    return f"{base}.{ext}"
 
 def client_ip() -> str:
     if request.remote_addr in TRUST_PROXY and "X-Forwarded-For" in request.headers:
         return request.headers["X-Forwarded-For"].split(",")[0].strip()
     return request.remote_addr or "unknown"
 
-# ── YouTube validation & canonicalisation ───────────────────────
-YOUTUBE_RE = re.compile(
-    r"^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)([\w-]{11})(?:[&#?].*)?$",
-    re.IGNORECASE,
-)
-
-def is_youtube_url(u: str) -> bool:
-    return bool(YOUTUBE_RE.match(u.strip()))
-
-def canonical(u: str) -> str:
-    m = YOUTUBE_RE.match(u.strip())
+def canonical(url: str) -> str:
+    m = YOUTUBE_RE.match(url.strip())
     return m.group(4).lower() if m else ""
 
-# ── sliding-window limiter (counts URLs) ────────────────────────
+def vid_key(vid: str, audio: bool) -> str:
+    return f"{vid}|{'a' if audio else 'v'}"
+
 def can_queue(ip: str, num_urls: int) -> bool:
     now = datetime.now(timezone.utc)
     dq = ip_recent[ip]
@@ -116,7 +102,9 @@ def can_queue(ip: str, num_urls: int) -> bool:
     dq.extend([now] * num_urls)
     return True
 
-# ───────── queue scheduling ────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
+# queue handling
+# ───────────────────────────────────────────────────────────────
 def launch_if_possible(ip: str) -> None:
     with LOCK:
         if ip in ip_active or not ip_queues[ip] or len(active_dl_set) >= MAX_DOWNLOADS_GLOBAL:
@@ -127,42 +115,66 @@ def launch_if_possible(ip: str) -> None:
         jobs[job_id]["status"] = "downloading"
     EXECUTOR.submit(download_job, job_id, jobs[job_id]["url"], ip)
 
-# ───────── download worker ─────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
+# download worker
+# ───────────────────────────────────────────────────────────────
 def download_job(job_id: str, url: str, ip: str) -> None:
-    def abort_hook(status):
-        # runs every ~0.5 s while yt-dlp is pulling fragments
+    def abort_hook(_):                      # fires ~0.5 s
         if jobs[job_id].get("cancelled"):
             raise DownloadError("cancelled")
 
-    outtmpl = os.path.join(DL_DIR, f"{job_id}.%(ext)s")
-    ydl_opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "merge_output_format": "mp4",
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [abort_hook],          # ← NEW
-    }
-    j = jobs[job_id]
+    j          = jobs[job_id]
+    # ── inside download_job ──
+    audio_only = j.get("audio")
+    ext        = "mp3" if audio_only else "mp4"          # ← was "m4a"
+
+    outtmpl    = os.path.join(DL_DIR, f"{job_id}.%(ext)s")
+
+    if audio_only:
+        ydl_opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio",
+            "outtmpl": outtmpl,
+            "quiet": True, "no_warnings": True,
+            "progress_hooks": [abort_hook],
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "0",
+            }],
+        }
+    else:
+        ydl_opts = {
+            "format": "bestvideo[ext=mp4]+bestaudio[ext=mp3]/best[ext=mp4]/best",
+            "merge_output_format": "mp4",
+            "outtmpl": outtmpl,
+            "quiet": True, "no_warnings": True,
+            "progress_hooks": [abort_hook],
+        }
+
     if not ffmpeg_ok():
         j.update(status="error", error="ffmpeg not found")
         _cleanup_job_state(ip, job_id)
         return
+
     try:
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
         if j.get("cancelled"):
-            raise ytdl_utils.DownloadError("cancelled")
+            raise DownloadError("cancelled")
+
         title = info.get("title") or ""
-        vid = info.get("id") or job_id
-        j.update(status="finished", file=f"{job_id}.mp4", name=clean_filename(title, vid))
-    except ytdl_utils.DownloadError as e:
-        j.update(status="cancelled" if "cancelled" in str(e) else "error", error=str(e))
-        for ext in (".mp4", ".m4a", ".part"):
-            try:
-                os.remove(outtmpl % {"ext": ext.lstrip(".")})
-            except FileNotFoundError:
-                pass
+        vid   = info.get("id") or job_id
+        j.update(
+            status="finished",
+            file=f"{job_id}.{ext}",
+            name=clean_filename(title, vid, ext),
+        )
+    except DownloadError as e:
+        j.update(status="cancelled" if "cancelled" in str(e) else "error",
+                 error=str(e))
+        for ex in (".mp4", ".mp3", ".part"):
+            try: os.remove(outtmpl % {"ext": ex.lstrip(".")})
+            except FileNotFoundError: pass
     except Exception as e:
         j.update(status="error", error=str(e))
     finally:
@@ -173,23 +185,26 @@ def _cleanup_job_state(ip: str, job_id: str) -> None:
     with LOCK:
         ip_active.pop(ip, None)
         active_dl_set.discard(job_id)
+
         status = jobs[job_id]["status"]
-        for vid, jid in list(url_map.items()):
+        for key, jid in list(url_map.items()):
             if jid == job_id:
                 if status == "finished":
-                    completed_cache[vid] = datetime.now(timezone.utc)
-                    url_map[vid] = "cached"
+                    completed_cache[key] = datetime.now(timezone.utc)
+                    url_map[key] = "cached"
                 else:
-                    url_map.pop(vid, None)
+                    url_map.pop(key, None)
 
-# ───────── periodic maintenance ────────────────────────────────
+# ───────────────────────────────────────────────────────────────
+# housekeeping
+# ───────────────────────────────────────────────────────────────
 def clean_files() -> None:
     cutoff = datetime.now(timezone.utc) - JOB_TTL
     for fn in os.listdir(DL_DIR):
-        fp = os.path.join(DL_DIR, fn)
+        fp = DL_DIR / fn
         try:
-            if os.path.isfile(fp) and datetime.fromtimestamp(os.path.getmtime(fp), timezone.utc) < cutoff:
-                os.remove(fp)
+            if fp.is_file() and datetime.fromtimestamp(fp.stat().st_mtime, timezone.utc) < cutoff:
+                fp.unlink()
         except OSError:
             pass
 
@@ -197,36 +212,40 @@ def purge_job_table() -> None:
     cutoff = datetime.now(timezone.utc) - JOB_TTL
     with LOCK:
         for jid, j in list(jobs.items()):
-            if j.get("created") and j["created"] < cutoff and j["status"] in {"finished", "error", "cancelled", "invalid"}:
+            if j.get("created") and j["created"] < cutoff \
+               and j["status"] in {"finished", "error", "cancelled", "invalid"}:
                 jobs.pop(jid, None)
-        valid_ids = set(jobs.keys())
-        for vid, jid in list(url_map.items()):
-            if jid not in valid_ids and jid != "cached":
-                url_map.pop(vid, None)
+        valid = set(jobs)
+        for key, jid in list(url_map.items()):
+            if jid not in valid and jid != "cached":
+                url_map.pop(key, None)
 
 def purge_completed_cache() -> None:
     cutoff = datetime.now(timezone.utc) - COMPLETED_CACHE_TTL
     with LOCK:
-        for vid, ts in list(completed_cache.items()):
+        for key, ts in list(completed_cache.items()):
             if ts < cutoff:
-                completed_cache.pop(vid, None)
-                url_map.pop(vid, None)
+                completed_cache.pop(key, None)
+                url_map.pop(key, None)
 
 scheduler = BackgroundScheduler(daemon=True)
-scheduler.add_job(clean_files,          "cron", hour=0, minute=0)   # nightly
-scheduler.add_job(purge_job_table,      "cron", hour="*")           # hourly
-scheduler.add_job(purge_completed_cache,"cron", minute="*/30")      # every 30 min
+scheduler.add_job(clean_files,          "cron", hour=0,   minute=0)
+scheduler.add_job(purge_job_table,      "cron", hour="*")
+scheduler.add_job(purge_completed_cache,"cron", minute="*/30")
 scheduler.start()
 
-# ───────── routes ──────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
+# routes
+# ───────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
     return render_template("index.html")
 
 @app.route("/start", methods=["POST"])
 def start():
-    raw  = (request.json.get("urls") or "").strip()
-    urls = [u for u in re.split(r"[,\s]+", raw) if u]
+    raw    = (request.json.get("urls") or "").strip()
+    audio  = bool(request.json.get("audio"))
+    urls   = [u for u in re.split(r"[,\s]+", raw) if u]
 
     if not urls:
         return jsonify({"error": "No URL provided"}), 400
@@ -240,33 +259,34 @@ def start():
         return jsonify({"error": f"Per-IP queue limit {MAX_QUEUE_PER_IP} exceeded"}), 429
 
     resp: dict[str, str | dict] = {}
-    now = datetime.now(timezone.utc)
+    now  = datetime.now(timezone.utc)
 
     with LOCK:
         for url in urls:
-            if not is_youtube_url(url):
+            if not YOUTUBE_RE.match(url):
                 resp[url] = {"error": "Not a valid YouTube link"}
                 continue
-            vid = canonical(url)
 
-            # duplicate in-flight or cached?
-            if vid in url_map:
-                resp[url] = url_map[vid]      # job_id or "cached"
+            vid    = canonical(url)
+            key    = vid_key(vid, audio)
+
+            # duplicate?
+            if key in url_map:
+                resp[url] = url_map[key]
                 continue
-            # duplicate recently finished?
-            if vid in completed_cache and now - completed_cache[vid] < COMPLETED_CACHE_TTL:
-                url_map[vid] = "cached"
-                resp[url] = "cached"
+            if key in completed_cache and now - completed_cache[key] < COMPLETED_CACHE_TTL:
+                url_map[key] = "cached"
+                resp[url]    = "cached"
                 continue
 
-            # create new job
             job_id = str(uuid.uuid4())
-            url_map[vid] = job_id
+            url_map[key] = job_id
             jobs[job_id] = {
-                "status": "queued",
-                "url": url,
-                "ip": ip,
+                "status":  "queued",
+                "url":     url,
+                "ip":      ip,
                 "created": now,
+                "audio":   audio,
             }
             ip_queues[ip].append(job_id)
             resp[url] = job_id
@@ -284,54 +304,38 @@ def file(job_id):
     if not job or job.get("status") != "finished":
         return "Not ready", 404
 
-    path = os.path.join(DL_DIR, job["file"])
-    if not os.path.exists(path):
+    path = DL_DIR / job["file"]
+    if not path.exists():
         return "Missing file", 404
 
     def stream_and_delete():
-        """Yield the file in chunks, then remove it no-matter-what."""
         try:
             with open(path, "rb") as f:
                 for chunk in iter(lambda: f.read(65536), b""):
                     yield chunk
         finally:
-            # Best-effort removal of the artefact and job cleanup
-            try:
-                os.remove(path)
-            except FileNotFoundError:
-                pass
+            try: path.unlink()
+            except FileNotFoundError: pass
             jobs.pop(job_id, None)
 
-    response = Response(
-        stream_with_context(stream_and_delete()),
-        mimetype="video/mp4",
-    )
-    response.headers["Content-Disposition"] = (
-        f'attachment; filename="{job.get("name", "video.mp4")}"'
-    )
-    response.headers["Cache-Control"] = "no-store"   # browser keeps its own copy
-    return response
-
-def _delete_with_retries(p: str, job_id: str, retries: int = 6, delay: float = 1.5) -> None:
-    for _ in range(retries):
-        try:
-            os.remove(p)
-            break
-        except PermissionError:
-            time.sleep(delay)
-        except FileNotFoundError:
-            break
-    jobs.pop(job_id, None)
+    mimetype = "audio/mp4" if path.suffix == ".mp3" else "video/mp4"
+    resp = Response(stream_with_context(stream_and_delete()), mimetype=mimetype)
+    resp.headers["Content-Disposition"] = f'attachment; filename="{job.get("name","file")}"'
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 @app.route("/cancel_all", methods=["POST"])
 def cancel_all():
     ip = client_ip()
     with LOCK:
-        for jid in list(ip_queues[ip]):          # queued
+        for jid in list(ip_queues[ip]):                          # queued
             ip_queues[ip].remove(jid)
             jobs[jid]["status"] = "cancelled"
-            url_map.pop(canonical(jobs[jid]["url"]), None)
-        jid = ip_active.get(ip)                  # active
+            # remove corresponding key from url_map
+            for k, v in list(url_map.items()):
+                if v == jid:
+                    url_map.pop(k, None)
+        jid = ip_active.get(ip)                                  # active
         if jid:
             jobs[jid]["cancelled"] = True
     return "", 204
@@ -347,5 +351,6 @@ def info():
             "global_queue" : sum(len(q) for q in ip_queues.values()),
         })
 
+# ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(port=int(os.getenv("PORT", 8989)), debug=False, use_reloader=False)

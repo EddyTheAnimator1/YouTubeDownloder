@@ -1,158 +1,157 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <title>YouTube Downloader</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-  <style>
-    /* a touch of spacing so the input doesn’t feel cramped */
-    #url { margin-bottom: 0.75rem; width: 100%; }
-    #queue p { margin: .25rem 0; font-size: .9rem; }
+<meta charset="utf-8" />
+<title>YouTube Downloader</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 
-    /* ───── fancy GitHub badge ───── */
-    #repo {
-      display: block;
-      margin: 2rem auto 0;
-      padding: .6rem 1.2rem;
-      width: max-content;
-      font-weight: 600;
-      color: #fff;
-      text-decoration: none;
-      border-radius: 6px;
-      background: linear-gradient(135deg, #000 0%, #ff6a00 100%);
-      background-size: 200% 200%;
-      background-position: 0% 50%;
-      transition: background-position .6s ease;
-    }
-    #repo:hover { background-position: 100% 50%; }
-  </style>
+<style>
+/* ——— palette ——— */
+:root{
+  --black: #000;
+  --red  : #d40000;            /* deep red */
+  --grad : linear-gradient(135deg, var(--black) 0%, var(--red) 100%);
+}
+
+/* ——— layout ——— */
+#url            { flex:1 1 auto; padding:.45rem .55rem; font-size:1rem; }
+
+.controls        { display:flex; gap:.5rem; align-items:center; }
+.controls > *    { height:2.45rem; }
+
+/* ——— buttons ——— */
+button{
+  padding:0 1.05rem; border:none; border-radius:6px;
+  background:var(--grad); background-size:200% 200%; background-position:0% 50%;
+  color:#fff; font:600 .95rem/1 sans-serif; cursor:pointer;
+  transition:background-position .35s ease;
+}
+button:hover:not(:disabled){ background-position:100% 50%; }
+button:disabled{ opacity:.55; cursor:not-allowed; }
+
+/* arrow toggle */
+#more{ width:2.45rem; display:grid; place-items:center; font-size:1.2rem; }
+#more.rot{ transform:rotate(180deg); transition:transform .25s ease; }
+
+/* ——— slide-down panel ——— */
+#panel          { overflow:hidden; max-height:0; transition:max-height .35s ease; }
+#panel.open     { max-height:4rem; }
+#panel label    { font-size:.9rem; display:inline-block; padding:.4rem 0; color:#fff; user-select:none; }
+#panel input    { transform:translateY(2px); }
+
+/* queue rows */
+#queue p        { margin:.25rem 0; font-size:.9rem; color:#fff; }
+
+/* body / card tweaks for dark look */
+body            { background:#111; color:#eee; font-family:sans-serif; }
+.card           { max-width:38rem; margin:4vh auto; padding:1.6rem 2rem 2.4rem;
+                  background:#181818; border-radius:12px; box-shadow:0 4px 14px rgba(0,0,0,.4); }
+
+/* GitHub badge */
+#repo{
+  display:block; margin:2rem auto 0; padding:.65rem 1.4rem;
+  width:max-content; font-weight:600; color:#fff; text-decoration:none;
+  border-radius:6px; background:var(--grad); background-size:200% 200%;
+  background-position:0% 50%; transition:background-position .35s ease;
+}
+#repo:hover{ background-position:100% 50%; }
+</style>
 </head>
 
 <body>
-  <div class="card">
-    <h1>YouTube Downloader</h1>
+<div class="card">
+  <h1 style="margin-top:0;color:#fff;">YouTube Downloader</h1>
 
-    <input id="url" type="text"
-           placeholder="Paste a YouTube link and press Download…">
+  <div class="controls">
+    <input id="url" type="text" placeholder="Paste a YouTube link…">
     <button id="go">Download</button>
-
-    <div id="queue" style="margin-top:1rem"></div>
-
-    <!-- ───── GitHub link ───── -->
-    <a id="repo"
-       href="https://github.com/EddyTheAnimator1/YouTubeDownloder"
-       target="_blank" rel="noopener">
-       View source on GitHub
-    </a>
+    <button id="more" title="Options">▼</button>
   </div>
 
-<script>
-/* DOM refs */
-const urlEl  = document.getElementById('url');
-const goBtn  = document.getElementById('go');
-const list   = document.getElementById('queue');
+  <div id="panel">
+    <label><input type="checkbox" id="audioOnly"> Download audio only</label>
+  </div>
 
-/* live stats line */
-const stats = document.createElement('p');
-stats.style.fontSize = '.85rem';
+  <div id="queue" style="margin-top:1rem"></div>
+
+  <a id="repo" href="https://github.com/EddyTheAnimator1/YouTubeDownloder"
+     target="_blank" rel="noopener">View source on GitHub</a>
+</div>
+
+<script>
+/* ───────── DOM refs ───────── */
+const urlEl   = document.getElementById('url');
+const goBtn   = document.getElementById('go');
+const moreBtn = document.getElementById('more');
+const panel   = document.getElementById('panel');
+const audioCB = document.getElementById('audioOnly');
+const list    = document.getElementById('queue');
+
+/* live stats footer */
+const stats=document.createElement('p');
+stats.style.fontSize='.85rem';stats.style.color='#ccc';
 document.querySelector('.card').appendChild(stats);
 
-/* memory cache: url → {blob,name} */
-const memory = new Map();
+/* cache keyed by url+mode */
+const memory=new Map();
+const keyFor=(u,a)=>`${u}|${a?'a':'v'}`;
 
-function save(blob, name='video.mp4') {
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = name;
-  a.click();
-}
-function row(text) {
-  const p = document.createElement('p');
-  p.textContent = text;
-  list.prepend(p);
-  return p;
+/* helpers */
+const row=t=>{const p=document.createElement('p');p.textContent=t;list.prepend(p);return p;};
+function save(blob,name){
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();
 }
 
-/* periodic stats poll */
-async function pollStats() {
-  try {
-    const r   = await fetch('/info');
-    const inf = await r.json();
-    stats.textContent =
-      `You: ${inf.your_active}+${inf.your_queue} queued | ` +
-      `Server: ${inf.global_active} active / ${inf.global_queue} queued`;
-  } catch { /* silent */ }
+/* toggle */
+moreBtn.onclick=()=>{ moreBtn.classList.toggle('rot'); panel.classList.toggle('open'); };
+
+/* nuke on close */
+function nuke(){ try{if(navigator.sendBeacon('/cancel_all',''))return;}catch{}
+  fetch('/cancel_all',{method:'POST',keepalive:true}); }
+addEventListener('beforeunload',nuke); addEventListener('pagehide',nuke); addEventListener('unload',nuke);
+
+/* stats poll */
+async function pollStats(){
+  try{
+    const j=await (await fetch('/info')).json();
+    stats.textContent=`You: ${j.your_active}+${j.your_queue} queued | `
+      +`Server: ${j.global_active} active / ${j.global_queue} queued`;
+  }catch{}
 }
-setInterval(pollStats, 2000);
-pollStats();
+setInterval(pollStats,2000); pollStats();
 
-/* ───── kill-switch on tab close ───── */
-function nuke() {
-  try {
-    /* primary: Beacon API with empty body */
-    if (navigator.sendBeacon && navigator.sendBeacon('/cancel_all', '')) return;
-  } catch { /* fall through */ }
-  /* secondary: fetch with keep-alive (guaranteed to complete) */
-  fetch('/cancel_all', {method:'POST', keepalive:true,
-                        headers:{'Content-Type':'text/plain'}});
-}
-/* fire nuke on all possible teardown events */
-window.addEventListener('beforeunload', nuke);
-window.addEventListener('pagehide',     nuke);
-window.addEventListener('unload',       nuke);   /* NEW — covers the stragglers */
-
-/* main click handler */
-goBtn.onclick = async () => {
-  const url = urlEl.value.trim();
-  if (!url) { urlEl.focus(); return; }
-  urlEl.value = '';
-
-  goBtn.disabled = true;
-  try {
-    if (memory.has(url)) {
-      const {blob,name} = memory.get(url);
-      save(blob, name);
-      return;
-    }
-    const r    = await fetch('/start', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({urls:url})
-    });
-    const data = await r.json();
-    if (data.error) { row('❌ ' + data.error); return; }
-
-    const job_id = data[url];
-    const line   = row(`${url} — 🕐 queued`);
-    poll(job_id, url, line);
-  } finally { goBtn.disabled = false; }
+/* main click */
+goBtn.onclick=async()=>{
+  const url=urlEl.value.trim(); if(!url){urlEl.focus();return;} urlEl.value='';
+  const audio=audioCB.checked, cacheKey=keyFor(url,audio);
+  goBtn.disabled=true;
+  try{
+    if(memory.has(cacheKey)){ const {blob,name}=memory.get(cacheKey); save(blob,name); return; }
+    const r=await fetch('/start',{method:'POST',headers:{'Content-Type':'application/json'},
+                 body:JSON.stringify({urls:url,audio})});
+    const data=await r.json(); if(data.error){row('❌ '+data.error);return;}
+    const job_id=data[url]; const line=row(`${url} — 🕐 queued`);
+    poll(job_id,url,line,audio,cacheKey);
+  }finally{goBtn.disabled=false;}
 };
 
-async function poll(job_id, url, line) {
-  const timer = setInterval(async () => {
-    const r   = await fetch('/status/' + job_id);
-    const job = await r.json();
-
-    if (job.status === 'queued') {
-      line.textContent = `${url} — ⏳ in queue`;
-    } else if (job.status === 'downloading') {
-      line.textContent = `${url} — ⬇️ downloading…`;
-    } else if (job.status === 'finished') {
-      clearInterval(timer);
-      line.textContent = `${url} — 📦 fetching…`;
-      const fileRes = await fetch('/file/' + job_id);
-      const blob    = await fileRes.blob();
-      memory.set(url, {blob, name: job.name || 'video.mp4'});
-      line.textContent = `${url} — ✅ done`;
-      save(blob, job.name || 'video.mp4');
-    } else if (job.status === 'cancelled') {
-      clearInterval(timer);
-      line.textContent = `${url} — 🚫 cancelled`;
-    } else if (job.status === 'error') {
-      clearInterval(timer);
-      line.textContent = `${url} — ❌ ${job.error}`;
+/* poll loop */
+async function poll(job_id,url,line,audio,cacheKey){
+  const timer=setInterval(async()=>{
+    const job=await (await fetch('/status/'+job_id)).json();
+    if(job.status==='queued')            line.textContent=`${url} — ⏳ in queue`;
+    else if(job.status==='downloading')  line.textContent=`${url} — ⬇️ downloading…`;
+    else if(job.status==='finished'){
+      clearInterval(timer); line.textContent=`${url} — 📦 fetching…`;
+      const blob=await (await fetch('/file/'+job_id)).blob();
+      const fname=job.name||(audio?'audio.mp3':'video.mp4');
+      memory.set(cacheKey,{blob,name:fname});
+      line.textContent=`${url} — ✅ done`;
+      save(blob,fname);
     }
-  }, 1000);
+    else if(job.status==='cancelled'){clearInterval(timer); line.textContent=`${url} — 🚫 cancelled`;}
+    else if(job.status==='error'){clearInterval(timer); line.textContent=`${url} — ❌ ${job.error}`;}
+  },1000);
 }
 </script>
 </body>
