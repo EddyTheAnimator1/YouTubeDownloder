@@ -1,0 +1,6 @@
+
+[phases.setup]
+aptPkgs = ["ffmpeg"]            # Debian/Ubuntu package name
+
+[start]
+cmd = "gunicorn app:app --bind 0.0.0.0:${PORT}"

@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>YouTube Downloader</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <style>
+    /* a touch of spacing so the input doesn’t feel cramped */
+    #url { margin-bottom: 0.75rem; width: 100%; }
+    #queue p { margin: .25rem 0; font-size: .9rem; }
+
+    /* ───── fancy GitHub badge ───── */
+    #repo {
+      display: block;
+      margin: 2rem auto 0;                 /* pushes it to the bottom of the card */
+      padding: .6rem 1.2rem;
+      width: max-content;                  /* content-hugging */
+      font-weight: 600;
+      color: #fff;
+      text-decoration: none;
+      border-radius: 6px;
+      background: linear-gradient(135deg, #000 0%, #ff6a00 100%);
+      background-size: 200% 200%;
+      background-position: 0% 50%;
+      transition: background-position .6s ease;
+    }
+    #repo:hover {
+      background-position: 100% 50%;       /* smooth slide on hover */
+    }
+  </style>
+</head>
+
+<body>
+  <div class="card">
+    <h1>YouTube Downloader</h1>
+
+    <input id="url" type="text"
+           placeholder="Paste a YouTube link and press Download…">
+    <button id="go">Download</button>
+
+    <div id="queue" style="margin-top:1rem"></div>
+
+    <!-- ───── GitHub link ───── -->
+<!-- good -->
+<a id="repo"
+   href="https://github.com/your-username/your-repo"
+   target="_blank" rel="noopener">
+   View source on GitHub           <!-- only this is visible -->
+</a>
+  </div>
+
+<script>
+/* DOM refs */
+const urlEl  = document.getElementById('url');
+const goBtn  = document.getElementById('go');
+const list   = document.getElementById('queue');
+
+/* new stats display */
+const stats = document.createElement('p');
+stats.style.fontSize = '.85rem';
+document.querySelector('.card').appendChild(stats);
+
+/* cache: url → {blob,name} */
+const memory = new Map();
+
+function save(blob, name='video.mp4') {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+}
+function row(text) {
+  const p = document.createElement('p');
+  p.textContent = text;
+  list.prepend(p);
+  return p;
+}
+
+/* periodic stats poll */
+async function pollStats() {
+  try {
+    const r   = await fetch('/info');
+    const inf = await r.json();
+    stats.textContent =
+      `You: ${inf.your_active}+${inf.your_queue} queued | ` +
+      `Server: ${inf.global_active} active / ${inf.global_queue} queued`;
+  } catch { /* silent */ }
+}
+setInterval(pollStats, 2000);
+pollStats();
+
+/* cancel all on unload */
+window.addEventListener('beforeunload', () => {
+  navigator.sendBeacon('/cancel_all');
+});
+
+/* main click handler */
+goBtn.onclick = async () => {
+  const url = urlEl.value.trim();
+  if (!url) { urlEl.focus(); return; }
+  urlEl.value = '';
+
+  goBtn.disabled = true;
+  try {
+    if (memory.has(url)) {
+      const {blob,name} = memory.get(url);
+      save(blob, name);
+      return;
+    }
+    const r    = await fetch('/start', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({urls:url})
+    });
+    const data = await r.json();
+    if (data.error) { row('❌ ' + data.error); return; }
+
+    const job_id = data[url];
+    const line   = row(`${url} — 🕐 queued`);
+    poll(job_id, url, line);
+  } finally {
+    goBtn.disabled = false;
+  }
+};
+
+async function poll(job_id, url, line) {
+  const timer = setInterval(async () => {
+    const r   = await fetch('/status/' + job_id);
+    const job = await r.json();
+
+    if (job.status === 'queued') {
+      line.textContent = `${url} — ⏳ in queue`;
+    } else if (job.status === 'downloading') {
+      line.textContent = `${url} — ⬇️ downloading…`;
+    } else if (job.status === 'finished') {
+      clearInterval(timer);
+      line.textContent = `${url} — 📦 fetching…`;
+      const fileRes = await fetch('/file/' + job_id);
+      const blob    = await fileRes.blob();
+      memory.set(url, {blob, name: job.name || 'video.mp4'});
+      line.textContent = `${url} — ✅ done`;
+      save(blob, job.name || 'video.mp4');
+    } else if (job.status === 'cancelled') {
+      clearInterval(timer);
+      line.textContent = `${url} — 🚫 cancelled`;
+    } else if (job.status === 'error') {
+      clearInterval(timer);
+      line.textContent = `${url} — ❌ ${job.error}`;
+    }
+  }, 1000);
+}
+</script>
+</body>
+</html>
