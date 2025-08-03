@@ -15,7 +15,7 @@ import os, re, unicodedata, uuid, shutil, time, threading, concurrent.futures
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, render_template, request, jsonify, send_file, Response
+from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
 from yt_dlp import YoutubeDL, utils as ytdl_utils
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -277,21 +277,34 @@ def file(job_id):
     job = jobs.get(job_id)
     if not job or job.get("status") != "finished":
         return "Not ready", 404
+
     path = os.path.join(DL_DIR, job["file"])
     if not os.path.exists(path):
         return "Missing file", 404
 
-    resp: Response = send_file(
-        path,
-        as_attachment=True,
-        download_name=job.get("name", "video.mp4"),
+    def stream_and_delete():
+        """Yield the file in chunks, then remove it no-matter-what."""
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    yield chunk
+        finally:
+            # Best-effort removal of the artefact and job cleanup
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+            jobs.pop(job_id, None)
+
+    response = Response(
+        stream_with_context(stream_and_delete()),
         mimetype="video/mp4",
     )
-
-    @resp.call_on_close
-    def _auto_delete():
-        threading.Thread(target=_delete_with_retries, args=(path, job_id), daemon=True).start()
-    return resp
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="{job.get("name", "video.mp4")}"'
+    )
+    response.headers["Cache-Control"] = "no-store"   # browser keeps its own copy
+    return response
 
 def _delete_with_retries(p: str, job_id: str, retries: int = 6, delay: float = 1.5) -> None:
     for _ in range(retries):
