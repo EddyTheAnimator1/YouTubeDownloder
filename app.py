@@ -21,8 +21,37 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 # ───────── configurable limits ──────────────────────────────────
 BASE_DIR                  = os.path.dirname(__file__)
-DL_DIR = os.getenv("DL_DIR", "/data")   # mounted volume
-os.makedirs(DL_DIR, exist_ok=True)
+
+# ─── persistent download directory detection ───────────────────────────
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent
+
+def _detect_dl_dir() -> Path:
+    """Return a persistent directory for video files.
+
+    Priority:
+      1. Explicit DL_DIR env var (always wins)
+      2. Railway-attached volume mount path
+      3. Hard-coded /data fallback when running on Railway
+      4. Local dev: <project>/downloads
+    """
+    # 1. Let the operator override everything
+    if os.getenv("DL_DIR"):
+        return Path(os.getenv("DL_DIR"))
+
+    # 2. Auto-detect Railway volume mount (if you added one)
+    if os.getenv("RAILWAY_VOLUME_MOUNT_PATH"):
+        return Path(os.getenv("RAILWAY_VOLUME_MOUNT_PATH"))
+
+    # 3. Any other Railway container (no volume attached yet)
+    if os.getenv("RAILWAY_PROJECT_ID"):
+        return Path("/data")           # matches Railway’s default UI suggestion
+
+    # 4. Fall back to a local folder next to the code
+    return BASE_DIR / "downloads"
+
+DL_DIR = _detect_dl_dir()
+DL_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_ACTIVE_PER_IP         = 1      # sequential per IP
 MAX_DOWNLOADS_GLOBAL      = 100    # concurrent workers
