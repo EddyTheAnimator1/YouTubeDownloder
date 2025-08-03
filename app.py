@@ -21,7 +21,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 
 # ───────── configurable limits ──────────────────────────────────
 BASE_DIR                  = os.path.dirname(__file__)
-DL_DIR                    = os.path.join(BASE_DIR, "downloads")
+DL_DIR = os.getenv("DL_DIR", "/data")   # mounted volume
 os.makedirs(DL_DIR, exist_ok=True)
 
 MAX_ACTIVE_PER_IP         = 1      # sequential per IP
