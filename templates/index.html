@@ -12,9 +12,9 @@
     /* ───── fancy GitHub badge ───── */
     #repo {
       display: block;
-      margin: 2rem auto 0;                 /* pushes it to the bottom of the card */
+      margin: 2rem auto 0;
       padding: .6rem 1.2rem;
-      width: max-content;                  /* content-hugging */
+      width: max-content;
       font-weight: 600;
       color: #fff;
       text-decoration: none;
@@ -24,9 +24,7 @@
       background-position: 0% 50%;
       transition: background-position .6s ease;
     }
-    #repo:hover {
-      background-position: 100% 50%;       /* smooth slide on hover */
-    }
+    #repo:hover { background-position: 100% 50%; }
   </style>
 </head>
 
@@ -41,12 +39,11 @@
     <div id="queue" style="margin-top:1rem"></div>
 
     <!-- ───── GitHub link ───── -->
-<!-- good -->
-<a id="repo"
-   href="https://github.com/EddyTheAnimator1/YouTubeDownloder"
-   target="_blank" rel="noopener">
-   View source on GitHub           <!-- only this is visible -->
-</a>
+    <a id="repo"
+       href="https://github.com/EddyTheAnimator1/YouTubeDownloder"
+       target="_blank" rel="noopener">
+       View source on GitHub
+    </a>
   </div>
 
 <script>
@@ -55,12 +52,12 @@ const urlEl  = document.getElementById('url');
 const goBtn  = document.getElementById('go');
 const list   = document.getElementById('queue');
 
-/* new stats display */
+/* live stats line */
 const stats = document.createElement('p');
 stats.style.fontSize = '.85rem';
 document.querySelector('.card').appendChild(stats);
 
-/* cache: url → {blob,name} */
+/* memory cache: url → {blob,name} */
 const memory = new Map();
 
 function save(blob, name='video.mp4') {
@@ -89,10 +86,20 @@ async function pollStats() {
 setInterval(pollStats, 2000);
 pollStats();
 
-/* cancel all on unload */
-window.addEventListener('beforeunload', () => {
-  navigator.sendBeacon('/cancel_all');
-});
+/* ───── kill-switch on tab close ───── */
+function nuke() {
+  try {
+    /* primary: Beacon API with empty body */
+    if (navigator.sendBeacon && navigator.sendBeacon('/cancel_all', '')) return;
+  } catch { /* fall through */ }
+  /* secondary: fetch with keep-alive (guaranteed to complete) */
+  fetch('/cancel_all', {method:'POST', keepalive:true,
+                        headers:{'Content-Type':'text/plain'}});
+}
+/* fire nuke on all possible teardown events */
+window.addEventListener('beforeunload', nuke);
+window.addEventListener('pagehide',     nuke);
+window.addEventListener('unload',       nuke);   /* NEW — covers the stragglers */
 
 /* main click handler */
 goBtn.onclick = async () => {
@@ -118,9 +125,7 @@ goBtn.onclick = async () => {
     const job_id = data[url];
     const line   = row(`${url} — 🕐 queued`);
     poll(job_id, url, line);
-  } finally {
-    goBtn.disabled = false;
-  }
+  } finally { goBtn.disabled = false; }
 };
 
 async function poll(job_id, url, line) {

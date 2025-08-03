@@ -16,7 +16,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, render_template, request, jsonify, send_file, Response, stream_with_context
-from yt_dlp import YoutubeDL, utils as ytdl_utils
+from yt_dlp import YoutubeDL, utils as ytdl_utils, DownloadError   # add DownloadError
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ───────── configurable limits ──────────────────────────────────
@@ -129,6 +129,11 @@ def launch_if_possible(ip: str) -> None:
 
 # ───────── download worker ─────────────────────────────────────
 def download_job(job_id: str, url: str, ip: str) -> None:
+    def abort_hook(status):
+        # runs every ~0.5 s while yt-dlp is pulling fragments
+        if jobs[job_id].get("cancelled"):
+            raise DownloadError("cancelled")
+
     outtmpl = os.path.join(DL_DIR, f"{job_id}.%(ext)s")
     ydl_opts = {
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
@@ -136,6 +141,7 @@ def download_job(job_id: str, url: str, ip: str) -> None:
         "outtmpl": outtmpl,
         "quiet": True,
         "no_warnings": True,
+        "progress_hooks": [abort_hook],          # ← NEW
     }
     j = jobs[job_id]
     if not ffmpeg_ok():
