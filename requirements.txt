@@ -1,4 +1,4 @@
 flask
 yt-dlp
 apscheduler
-gunicore
+gunicorn
